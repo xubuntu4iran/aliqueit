@@ -25,6 +25,85 @@
 #include <gmpxx.h>
 #pragma warning(pop)
 
+// POSIX interruptible replacement for system(): stop the entire child job
+// (shell, pipelines, YAFU/Msieve/ECM descendants) on Ctrl+C.
+#ifndef _WIN32
+#include <csignal>
+#include <cerrno>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t interrupted = 0;
+static volatile sig_atomic_t active_child = 0;
+
+static void on_interrupt(int) {
+    interrupted = 1;
+    // async-signal-safe: the child owns its own process group
+    if (active_child > 0) kill(-static_cast<pid_t>(active_child), SIGINT);
+}
+
+static void install_interrupt_handler() {
+    struct sigaction sa = {};
+    sa.sa_handler = on_interrupt;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+}
+
+static void check_interrupt() {
+    if (interrupted) {
+        const char msg[] = "\nInterrupted (Ctrl+C); stopping without advancing sequence.\n";
+        write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        _exit(130);
+    }
+}
+
+static int interruptible_system(const char *cmd) {
+    check_interrupt();
+    pid_t child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        setpgid(0, 0);
+        struct sigaction sa = {};
+        sa.sa_handler = SIG_DFL;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT, &sa, nullptr);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)nullptr);
+        _exit(127);
+    }
+    setpgid(child, child);
+    active_child = static_cast<sig_atomic_t>(child);
+    if (interrupted) kill(-child, SIGINT);
+    int status = 0;
+    pid_t result;
+    do { result = waitpid(child, &status, 0); }
+    while (result == -1 && errno == EINTR && !interrupted);
+    if (interrupted) {
+        kill(-child, SIGINT);
+        // Give child processes time to handle SIGINT and save checkpoints.
+        // Reap the shell; if it ignores SIGINT, terminate the process group.
+        if (result == -1) {
+            for (int i = 0; i < 20; ++i) {
+                result = waitpid(child, &status, WNOHANG);
+                if (result == child || (result == -1 && errno == ECHILD)) break;
+                usleep(100000);
+            }
+            if (result == 0 || (result == -1 && errno != ECHILD)) {
+                kill(-child, SIGTERM);
+                while (waitpid(child, &status, 0) == -1 && errno == EINTR) {}
+            }
+        }
+        active_child = 0;
+        check_interrupt();
+    }
+    active_child = 0;
+    if (result == -1) return -1;
+    return status;
+}
+#define system interruptible_system
+#endif
+
 using namespace std;
 
 
@@ -1019,6 +1098,9 @@ bool submit_elf(mpz_class & seq, int from_iteration) {
 }
 
 int main(int argc, char ** argv) {
+#ifndef _WIN32
+    install_interrupt_handler();
+#endif
     if (argc < 2) {
         print_help();
         return 1;
@@ -1173,6 +1255,9 @@ int main(int argc, char ** argv) {
     find_previous_factors(n, external_factors); //see if we can find any previously found factors
 
     for (; n != 1; ++index) {
+#ifndef _WIN32
+        check_interrupt();
+#endif
         bool max_digits_reached = false;
         bool require_both_digits_and_cofactor = both_digits_and_cofactor && max_digits > 0 && max_cofactor > 0;
         int curr_max_cofactor = 0;
